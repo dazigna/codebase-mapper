@@ -8,6 +8,7 @@ which files to inspect before you spend context on full source files.
 
 - Parses Python files with Tree-sitter.
 - Extracts top-level imports, classes, methods, and functions.
+- Counts cross-file call references and uses them as ranking signal.
 - Resolves internal imports across monorepo-style layouts.
 - Builds an internal dependency graph.
 - Ranks files with a pure-Python PageRank implementation.
@@ -41,6 +42,8 @@ Useful flags:
 - `--out`: write output to a file instead of stdout
 - `--exclude`: add extra directories to skip
 - `--log`: write parser errors to a log file
+- `--focus-file`: boost files matching this path fragment
+- `--focus-symbol`: boost files that define or call this symbol
 
 ## Testing
 

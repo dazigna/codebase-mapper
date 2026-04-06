@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,12 +47,19 @@ class FileSummary:
     module: str
     imports: list[ImportSpec] = field(default_factory=list)
     internal_imports: list[str] = field(default_factory=list)
+    reference_counts: dict[str, int] = field(default_factory=dict)
     classes: list[ClassSymbol] = field(default_factory=list)
     functions: list[FunctionSymbol] = field(default_factory=list)
 
 
 class RepoMapBuilder:
-    def __init__(self, root_path: str, exclude_dirs: list[str] | None = None):
+    def __init__(
+        self,
+        root_path: str,
+        exclude_dirs: list[str] | None = None,
+        focus_files: list[str] | None = None,
+        focus_symbols: list[str] | None = None,
+    ):
         self.root_path = os.path.abspath(root_path)
         default_exclude = [
             ".git",
@@ -74,6 +82,8 @@ class RepoMapBuilder:
         self.module_to_paths: dict[str, set[str]] = {}
         self.graph = nx.DiGraph()
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.focus_files = [focus_file.lower() for focus_file in (focus_files or [])]
+        self.focus_symbols = [focus_symbol for focus_symbol in (focus_symbols or [])]
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text))
@@ -123,6 +133,7 @@ class RepoMapBuilder:
                 elif child.type == "decorated_definition":
                     self._parse_decorated_definition(child, lines, summary)
 
+            summary.reference_counts = self._collect_reference_counts(tree.root_node)
             self.file_data[rel_path] = summary
         except Exception as exc:
             logger.error(f"Failed to parse {rel_path}: {exc}")
@@ -283,6 +294,42 @@ class RepoMapBuilder:
 
         return node.text.decode("utf-8", errors="ignore").splitlines()[0].strip()
 
+    def _collect_reference_counts(self, node: Node) -> dict[str, int]:
+        reference_counts: defaultdict[str, int] = defaultdict(int)
+
+        def walk(current: Node) -> None:
+            if current.type == "call":
+                function_node = current.child_by_field_name("function")
+                for name in self._extract_reference_names(function_node):
+                    reference_counts[name] += 1
+
+            for child in current.children:
+                walk(child)
+
+        walk(node)
+        return dict(sorted(reference_counts.items()))
+
+    def _extract_reference_names(self, node: Node | None) -> list[str]:
+        if node is None:
+            return []
+
+        if node.type == "identifier":
+            return [node.text.decode("utf-8")]
+
+        if node.type == "attribute":
+            attribute_node = node.child_by_field_name("attribute")
+            if attribute_node is not None:
+                return [attribute_node.text.decode("utf-8")]
+
+            identifier_children = [child for child in node.children if child.type == "identifier"]
+            if identifier_children:
+                return [identifier_children[-1].text.decode("utf-8")]
+
+        if node.type == "call":
+            return self._extract_reference_names(node.child_by_field_name("function"))
+
+        return []
+
     def _package_parts(self, rel_path: str, module_name: str) -> list[str]:
         if not module_name:
             return []
@@ -441,14 +488,48 @@ class RepoMapBuilder:
 
             summary.internal_imports = sorted(internal_imports)
 
+    def _defined_symbols(self, summary: FileSummary) -> set[str]:
+        defined_symbols = {function_symbol.name for function_symbol in summary.functions}
+
+        for class_symbol in summary.classes:
+            defined_symbols.add(class_symbol.name)
+            for method_symbol in class_symbol.methods:
+                defined_symbols.add(method_symbol.name)
+                defined_symbols.add(f"{class_symbol.name}.{method_symbol.name}")
+
+        return defined_symbols
+
     def _build_graph(self) -> None:
         self.graph = nx.DiGraph()
+        edge_weights: defaultdict[tuple[str, str], float] = defaultdict(float)
+        symbol_to_paths: defaultdict[str, set[str]] = defaultdict(set)
+
         for path in self.file_data:
             self.graph.add_node(path)
 
         for path, summary in self.file_data.items():
             for target_path in summary.internal_imports:
-                self.graph.add_edge(path, target_path)
+                edge_weights[(path, target_path)] += 1.0
+
+            for symbol_name in self._defined_symbols(summary):
+                symbol_to_paths[symbol_name].add(path)
+
+        for path, summary in self.file_data.items():
+            for symbol_name, reference_count in summary.reference_counts.items():
+                target_paths = sorted(
+                    target_path
+                    for target_path in symbol_to_paths.get(symbol_name, set())
+                    if target_path != path
+                )
+                if not target_paths:
+                    continue
+
+                shared_weight = reference_count / len(target_paths)
+                for target_path in target_paths:
+                    edge_weights[(path, target_path)] += shared_weight
+
+        for (source_path, target_path), weight in edge_weights.items():
+            self.graph.add_edge(source_path, target_path, weight=weight)
 
     def _pagerank(
         self, alpha: float = 0.85, max_iter: int = 100, tol: float = 1.0e-6
@@ -459,8 +540,15 @@ class RepoMapBuilder:
 
         node_count = len(nodes)
         scores = {node: 1.0 / node_count for node in nodes}
-        out_degree = {node: self.graph.out_degree(node) for node in nodes}
-        dangling_nodes = [node for node, degree in out_degree.items() if degree == 0]
+        outgoing_weight = {
+            node: sum(
+                self.graph[node][target]["weight"] for target in self.graph.successors(node)
+            )
+            for node in nodes
+        }
+        dangling_nodes = [
+            node for node, total_weight in outgoing_weight.items() if total_weight == 0
+        ]
 
         for _ in range(max_iter):
             previous_scores = scores
@@ -474,13 +562,15 @@ class RepoMapBuilder:
             }
 
             for source in nodes:
-                degree = out_degree[source]
-                if degree == 0:
+                total_weight = outgoing_weight[source]
+                if total_weight == 0:
                     continue
 
-                share = alpha * previous_scores[source] / degree
                 for target in self.graph.successors(source):
-                    scores[target] += share
+                    edge_weight = self.graph[source][target]["weight"]
+                    scores[target] += (
+                        alpha * previous_scores[source] * edge_weight / total_weight
+                    )
 
             error = sum(abs(scores[node] - previous_scores[node]) for node in nodes)
             if error < node_count * tol:
@@ -488,19 +578,48 @@ class RepoMapBuilder:
 
         return scores
 
+    def _focus_score(self, path: str) -> float:
+        summary = self.file_data[path]
+        defined_symbols = self._defined_symbols(summary)
+        referenced_symbols = set(summary.reference_counts)
+        normalized_path = path.lower()
+        base_name = Path(path).name.lower()
+        score = 0.0
+
+        for focus_file in self.focus_files:
+            if (
+                normalized_path == focus_file
+                or normalized_path.endswith(focus_file)
+                or base_name == focus_file
+            ):
+                score += 8.0
+            elif focus_file in normalized_path or focus_file in base_name:
+                score += 4.0
+
+        for focus_symbol in self.focus_symbols:
+            if focus_symbol in defined_symbols:
+                score += 6.0
+            elif focus_symbol in referenced_symbols:
+                score += 2.0
+
+        return score
+
     def _rank_files(self) -> list[tuple[str, float]]:
         if not self.graph.nodes:
             return []
 
         rankings = self._pagerank()
-        return sorted(rankings.items(), key=lambda item: (-item[1], item[0]))
+        boosted_rankings = {
+            path: score + self._focus_score(path) for path, score in rankings.items()
+        }
+        return sorted(boosted_rankings.items(), key=lambda item: (-item[1], item[0]))
 
     def _hotspot_line(self, path: str, score: float) -> str:
         summary = self.file_data[path]
         return (
             f"- {path} | score={score:.4f} | imported_by={self.graph.in_degree(path)} "
-            f"| imports={self.graph.out_degree(path)} | classes={len(summary.classes)} "
-            f"| functions={len(summary.functions)}"
+            f"| imports={self.graph.out_degree(path)} | calls={sum(summary.reference_counts.values())} "
+            f"| classes={len(summary.classes)} | functions={len(summary.functions)}"
         )
 
     def _format_class(self, symbol: ClassSymbol) -> list[str]:
@@ -609,13 +728,30 @@ def main() -> None:
         "--log", type=str, default="repomap.log", help="File to store error logs"
     )
     cli.add_argument("--exclude", nargs="+", help="Additional directories to exclude")
+    cli.add_argument(
+        "--focus-file",
+        action="append",
+        default=[],
+        help="Boost ranking for files matching this path fragment. Can be passed multiple times.",
+    )
+    cli.add_argument(
+        "--focus-symbol",
+        action="append",
+        default=[],
+        help="Boost ranking for files that define or call this symbol. Can be passed multiple times.",
+    )
 
     args = cli.parse_args()
 
     logger.remove()
     logger.add(args.log, level="ERROR", rotation="5 MB")
 
-    builder = RepoMapBuilder(args.root, exclude_dirs=args.exclude)
+    builder = RepoMapBuilder(
+        args.root,
+        exclude_dirs=args.exclude,
+        focus_files=args.focus_file,
+        focus_symbols=args.focus_symbol,
+    )
 
     print(f"--- Scanning {os.path.abspath(args.root)} ---", file=sys.stderr)
     builder.analyze_repo()

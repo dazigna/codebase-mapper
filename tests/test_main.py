@@ -1,7 +1,10 @@
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from main import RepoMapBuilder
 
@@ -76,6 +79,66 @@ class RepoMapBuilderTests(unittest.TestCase):
         self.assertIn("### service/app/api/routes.py", repo_map)
         self.assertIn("module: app.api.routes", repo_map)
         self.assertIn("methods: L6 build", repo_map)
+
+    def test_reference_counts_increase_graph_edge_weight(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/helpers.py": """
+                def helper():
+                    return 1
+            """,
+            "pkg/runner.py": """
+                from pkg.helpers import helper
+
+                def run():
+                    helper()
+                    helper()
+                    helper()
+            """,
+        }
+
+        for relative_path, content in files.items():
+            file_path = root / relative_path
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
+
+        builder = RepoMapBuilder(str(root))
+        builder.analyze_repo()
+
+        runner_summary = builder.file_data["pkg/runner.py"]
+        self.assertEqual(runner_summary.reference_counts["helper"], 3)
+        self.assertEqual(
+            builder.graph["pkg/runner.py"]["pkg/helpers.py"]["weight"],
+            4.0,
+        )
+
+    def test_focus_inputs_boost_ranking(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+
+        files = {
+            "alpha.py": "def first():\n    return 1\n",
+            "beta.py": "def target():\n    return 2\n",
+        }
+
+        for relative_path, content in files.items():
+            file_path = root / relative_path
+            file_path.write_text(content, encoding="utf-8")
+
+        builder = RepoMapBuilder(
+            str(root),
+            focus_files=["beta.py"],
+            focus_symbols=["target"],
+        )
+        builder.analyze_repo()
+
+        ranked_paths = [path for path, _score in builder._rank_files()]
+        self.assertEqual(ranked_paths[0], "beta.py")
 
 
 if __name__ == "__main__":
